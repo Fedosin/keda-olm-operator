@@ -17,15 +17,17 @@ limitations under the License.
 // Package gcp implements GCP Workload Identity Federation (WIF) support for the
 // keda-operator Deployment managed by this operator.
 //
-// OpenShift passes the WIF parameters to OLM-managed operators as environment
-// variables on the operator pod: the OperatorHub console sets PROJECT_NUMBER,
-// POOL_ID, PROVIDER_ID and SERVICE_ACCOUNT_EMAIL through the Subscription, and
-// CLI installs set AUDIENCE and SERVICE_ACCOUNT_EMAIL. From these the operator
-// renders a GCP external_account credential configuration into a Secret and
-// wires it, together with a projected service account token, into the
-// keda-operator Deployment. KEDA scalers that use `podIdentity.provider: gcp`
-// then authenticate to Google Cloud through Application Default Credentials
-// with short-lived tokens and no long-lived key anywhere in the cluster.
+// The WIF parameters come from spec.operator.gcpWorkloadIdentity of the
+// KedaController or, when that is not set, from environment variables on the
+// operator pod. The latter is how OpenShift passes them to OLM-managed operators:
+// the OperatorHub console sets PROJECT_NUMBER, POOL_ID, PROVIDER_ID and
+// SERVICE_ACCOUNT_EMAIL through the Subscription, and CLI installs set AUDIENCE
+// and SERVICE_ACCOUNT_EMAIL. From these the operator renders a GCP
+// external_account credential configuration into a Secret and wires it,
+// together with a projected service account token, into the keda-operator
+// Deployment. KEDA scalers that use `podIdentity.provider: gcp` then
+// authenticate to Google Cloud through Application Default Credentials with
+// short-lived tokens and no long-lived key anywhere in the cluster.
 package gcp
 
 import (
@@ -34,6 +36,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	kedav1alpha1 "github.com/kedacore/keda-olm-operator/api/keda/v1alpha1"
 )
 
 // Environment variables read from the operator pod. On OpenShift they are set on
@@ -76,6 +80,8 @@ var (
 
 // Config holds the validated GCP Workload Identity Federation parameters.
 type Config struct {
+	// Source tells where the parameters come from.
+	Source kedav1alpha1.GCPWorkloadIdentitySource
 	// Audience is the STS audience, i.e. the workload identity provider resource name.
 	Audience string
 	// ServiceAccountEmail is the GCP service account to impersonate.
@@ -85,6 +91,18 @@ type Config struct {
 	ProjectID string
 	// SubjectTokenAudience is the audience of the projected Kubernetes service account token.
 	SubjectTokenAudience string
+}
+
+// specFieldNames maps each parameter to its field in spec.operator.gcpWorkloadIdentity,
+// so that validation errors name what the administrator actually set.
+var specFieldNames = map[string]string{
+	EnvServiceAccountEmail:  "serviceAccountEmail",
+	EnvAudience:             "audience",
+	EnvProjectNumber:        "projectNumber",
+	EnvPoolID:               "poolID",
+	EnvProviderID:           "providerID",
+	EnvProjectID:            "projectID",
+	EnvSubjectTokenAudience: "subjectTokenAudience",
 }
 
 // ConfigFromEnv reads the WIF configuration from the process environment. It
@@ -97,26 +115,54 @@ func ConfigFromEnv() (*Config, error) {
 // ParseConfig builds the WIF configuration from the given environment lookup.
 // See ConfigFromEnv.
 func ParseConfig(getenv func(string) string) (*Config, error) {
-	email := strings.TrimSpace(getenv(EnvServiceAccountEmail))
-	audience := strings.TrimSpace(getenv(EnvAudience))
-	projectNumber := strings.TrimSpace(getenv(EnvProjectNumber))
-	poolID := strings.TrimSpace(getenv(EnvPoolID))
-	providerID := strings.TrimSpace(getenv(EnvProviderID))
-	subjectTokenAudience := strings.TrimSpace(getenv(EnvSubjectTokenAudience))
+	return parseConfig(getenv, func(env string) string { return env }, false,
+		kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment)
+}
 
-	if email == "" && audience == "" && projectNumber == "" && poolID == "" && providerID == "" && subjectTokenAudience == "" {
+// ConfigFromSpec builds the WIF configuration from spec.operator.gcpWorkloadIdentity.
+// The CRD already rejects most invalid values at admission; the same validation runs
+// here as well, because a KedaController may have been created before the CRD carried
+// those rules.
+func ConfigFromSpec(spec *kedav1alpha1.GCPWorkloadIdentitySpec) (*Config, error) {
+	values := map[string]string{
+		EnvServiceAccountEmail:  spec.ServiceAccountEmail,
+		EnvAudience:             spec.Audience,
+		EnvProjectNumber:        spec.ProjectNumber,
+		EnvPoolID:               spec.PoolID,
+		EnvProviderID:           spec.ProviderID,
+		EnvProjectID:            spec.ProjectID,
+		EnvSubjectTokenAudience: spec.SubjectTokenAudience,
+	}
+	return parseConfig(func(key string) string { return values[key] },
+		func(env string) string { return specFieldNames[env] }, true,
+		kedav1alpha1.GCPWorkloadIdentitySourceKedaController)
+}
+
+// parseConfig validates the parameters read through lookup, which is keyed by the
+// environment variable names. name turns such a key into the name the administrator
+// knows it by. Unless required is set, no parameters at all means that Workload
+// Identity is not configured, which is reported as (nil, nil).
+func parseConfig(lookup, name func(string) string, required bool, source kedav1alpha1.GCPWorkloadIdentitySource) (*Config, error) {
+	email := strings.TrimSpace(lookup(EnvServiceAccountEmail))
+	audience := strings.TrimSpace(lookup(EnvAudience))
+	projectNumber := strings.TrimSpace(lookup(EnvProjectNumber))
+	poolID := strings.TrimSpace(lookup(EnvPoolID))
+	providerID := strings.TrimSpace(lookup(EnvProviderID))
+	subjectTokenAudience := strings.TrimSpace(lookup(EnvSubjectTokenAudience))
+
+	if !required && email == "" && audience == "" && projectNumber == "" && poolID == "" && providerID == "" && subjectTokenAudience == "" {
 		return nil, nil
 	}
 
 	var errs []error
 
 	if email == "" {
-		errs = append(errs, fmt.Errorf("%s must be set", EnvServiceAccountEmail))
-	} else if err := validateServiceAccountEmail(email); err != nil {
+		errs = append(errs, fmt.Errorf("%s must be set", name(EnvServiceAccountEmail)))
+	} else if err := validateServiceAccountEmail(email, name); err != nil {
 		errs = append(errs, err)
 	}
 
-	audience, err := resolveAudience(audience, projectNumber, poolID, providerID)
+	audience, err := resolveAudience(audience, projectNumber, poolID, providerID, name)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -130,28 +176,29 @@ func ParseConfig(getenv func(string) string) (*Config, error) {
 	}
 
 	return &Config{
+		Source:               source,
 		Audience:             audience,
 		ServiceAccountEmail:  email,
-		ProjectID:            strings.TrimSpace(getenv(EnvProjectID)),
+		ProjectID:            strings.TrimSpace(lookup(EnvProjectID)),
 		SubjectTokenAudience: subjectTokenAudience,
 	}, nil
 }
 
-// resolveAudience returns the STS audience from either AUDIENCE or the
-// PROJECT_NUMBER/POOL_ID/PROVIDER_ID triplet. When both are given they have to
-// agree, so that an install can't silently end up with a provider the
-// administrator didn't intend.
-func resolveAudience(audience, projectNumber, poolID, providerID string) (string, error) {
+// resolveAudience returns the STS audience from either the audience itself or the
+// project number, pool ID and provider ID. When both are given they have to agree,
+// so that an install can't silently end up with a provider the administrator
+// didn't intend.
+func resolveAudience(audience, projectNumber, poolID, providerID string, name func(string) string) (string, error) {
 	tripletSet := projectNumber != "" || poolID != "" || providerID != ""
 
 	if audience == "" && !tripletSet {
 		return "", fmt.Errorf("either %s or all of %s, %s and %s must be set",
-			EnvAudience, EnvProjectNumber, EnvPoolID, EnvProviderID)
+			name(EnvAudience), name(EnvProjectNumber), name(EnvPoolID), name(EnvProviderID))
 	}
 
 	if audience != "" && !audienceRegexp.MatchString(audience) {
 		return "", fmt.Errorf("%s %q is not a workload identity provider resource name of the form %s",
-			EnvAudience, audience, fmt.Sprintf(audienceFormat, "<project_number>", "<pool_id>", "<provider_id>"))
+			name(EnvAudience), audience, fmt.Sprintf(audienceFormat, "<project_number>", "<pool_id>", "<provider_id>"))
 	}
 
 	if !tripletSet {
@@ -159,33 +206,33 @@ func resolveAudience(audience, projectNumber, poolID, providerID string) (string
 	}
 
 	var missing []string
-	for _, v := range []struct{ name, value string }{
+	for _, v := range []struct{ key, value string }{
 		{EnvProjectNumber, projectNumber},
 		{EnvPoolID, poolID},
 		{EnvProviderID, providerID},
 	} {
 		if v.value == "" {
-			missing = append(missing, v.name)
+			missing = append(missing, name(v.key))
 		}
 	}
 	if len(missing) > 0 {
 		return "", fmt.Errorf("%s must be set together with %s, %s and %s", strings.Join(missing, " and "),
-			EnvProjectNumber, EnvPoolID, EnvProviderID)
+			name(EnvProjectNumber), name(EnvPoolID), name(EnvProviderID))
 	}
 	if !projectNumberRegexp.MatchString(projectNumber) {
-		return "", fmt.Errorf("%s %q must be numeric", EnvProjectNumber, projectNumber)
+		return "", fmt.Errorf("%s %q must be numeric", name(EnvProjectNumber), projectNumber)
 	}
 	if !identifierRegexp.MatchString(poolID) {
-		return "", fmt.Errorf("%s %q contains characters not allowed in a workload identity pool ID", EnvPoolID, poolID)
+		return "", fmt.Errorf("%s %q contains characters not allowed in a workload identity pool ID", name(EnvPoolID), poolID)
 	}
 	if !identifierRegexp.MatchString(providerID) {
-		return "", fmt.Errorf("%s %q contains characters not allowed in a workload identity provider ID", EnvProviderID, providerID)
+		return "", fmt.Errorf("%s %q contains characters not allowed in a workload identity provider ID", name(EnvProviderID), providerID)
 	}
 
 	built := fmt.Sprintf(audienceFormat, projectNumber, poolID, providerID)
 	if audience != "" && audience != built {
 		return "", fmt.Errorf("%s %q does not match the provider %q built from %s, %s and %s; set only one of them",
-			EnvAudience, audience, built, EnvProjectNumber, EnvPoolID, EnvProviderID)
+			name(EnvAudience), audience, built, name(EnvProjectNumber), name(EnvPoolID), name(EnvProviderID))
 	}
 	return built, nil
 }
@@ -193,10 +240,10 @@ func resolveAudience(audience, projectNumber, poolID, providerID string) (string
 // validateServiceAccountEmail catches the typical mistakes (a project number or
 // a bare name pasted into the field) without being stricter than Google is
 // about the local part or the domain.
-func validateServiceAccountEmail(email string) error {
+func validateServiceAccountEmail(email string, name func(string) string) error {
 	local, domain, found := strings.Cut(email, "@")
 	if !found || local == "" || domain == "" || strings.Contains(domain, "@") || !strings.Contains(domain, ".") {
-		return fmt.Errorf("%s %q is not a service account email address", EnvServiceAccountEmail, email)
+		return fmt.Errorf("%s %q is not a service account email address", name(EnvServiceAccountEmail), email)
 	}
 	return nil
 }

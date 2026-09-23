@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	kedav1alpha1 "github.com/kedacore/keda-olm-operator/api/keda/v1alpha1"
 )
 
 const (
@@ -55,6 +57,7 @@ func TestParseConfig(t *testing.T) {
 				EnvServiceAccountEmail: testEmail,
 			},
 			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
 				Audience:             testAudience,
 				ServiceAccountEmail:  testEmail,
 				SubjectTokenAudience: DefaultSubjectTokenAudience,
@@ -69,6 +72,7 @@ func TestParseConfig(t *testing.T) {
 				EnvServiceAccountEmail: testEmail,
 			},
 			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
 				Audience:             testAudience,
 				ServiceAccountEmail:  testEmail,
 				SubjectTokenAudience: DefaultSubjectTokenAudience,
@@ -83,6 +87,7 @@ func TestParseConfig(t *testing.T) {
 				EnvSubjectTokenAudience: "sts.googleapis.com",
 			},
 			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
 				Audience:             testAudience,
 				ServiceAccountEmail:  testEmail,
 				ProjectID:            "other-project",
@@ -99,6 +104,7 @@ func TestParseConfig(t *testing.T) {
 				EnvServiceAccountEmail: testEmail,
 			},
 			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
 				Audience:             testAudience,
 				ServiceAccountEmail:  testEmail,
 				SubjectTokenAudience: DefaultSubjectTokenAudience,
@@ -233,5 +239,113 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if got == nil || got.Audience != testAudience || got.ServiceAccountEmail != testEmail {
 		t.Errorf("unexpected config %+v", got)
+	}
+}
+
+func TestConfigFromSpec(t *testing.T) {
+	tests := []struct {
+		name      string
+		spec      kedav1alpha1.GCPWorkloadIdentitySpec
+		want      *Config
+		wantErr   []string // substrings that have to appear in the error
+		notInErr  []string // substrings that must not appear, e.g. environment variable names
+		setEnvVar bool     // set conflicting environment variables, which must be ignored
+	}{
+		{
+			name: "audience",
+			spec: kedav1alpha1.GCPWorkloadIdentitySpec{ServiceAccountEmail: testEmail, Audience: testAudience},
+			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceKedaController,
+				Audience:             testAudience,
+				ServiceAccountEmail:  testEmail,
+				SubjectTokenAudience: DefaultSubjectTokenAudience,
+			},
+		},
+		{
+			name: "provider components, project and token audience",
+			spec: kedav1alpha1.GCPWorkloadIdentitySpec{
+				ServiceAccountEmail:  testEmail,
+				ProjectNumber:        "123456789012",
+				PoolID:               "my-pool",
+				ProviderID:           "my-provider",
+				ProjectID:            "my-project",
+				SubjectTokenAudience: "sts.googleapis.com",
+			},
+			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceKedaController,
+				Audience:             testAudience,
+				ServiceAccountEmail:  testEmail,
+				ProjectID:            "my-project",
+				SubjectTokenAudience: "sts.googleapis.com",
+			},
+		},
+		{
+			name:      "the operator environment does not leak into the spec",
+			spec:      kedav1alpha1.GCPWorkloadIdentitySpec{ServiceAccountEmail: testEmail, Audience: testAudience},
+			setEnvVar: true,
+			want: &Config{
+				Source:               kedav1alpha1.GCPWorkloadIdentitySourceKedaController,
+				Audience:             testAudience,
+				ServiceAccountEmail:  testEmail,
+				SubjectTokenAudience: DefaultSubjectTokenAudience,
+			},
+		},
+		{
+			name:     "an empty block is an error, not \"not configured\"",
+			spec:     kedav1alpha1.GCPWorkloadIdentitySpec{},
+			wantErr:  []string{"serviceAccountEmail must be set", "either audience or all of projectNumber, poolID and providerID must be set"},
+			notInErr: []string{"SERVICE_ACCOUNT_EMAIL", "AUDIENCE"},
+		},
+		{
+			name:     "a project alone is not enough",
+			spec:     kedav1alpha1.GCPWorkloadIdentitySpec{ProjectID: "my-project"},
+			wantErr:  []string{"serviceAccountEmail must be set"},
+			notInErr: []string{"SERVICE_ACCOUNT_EMAIL"},
+		},
+		{
+			name: "errors name the spec fields",
+			spec: kedav1alpha1.GCPWorkloadIdentitySpec{
+				ServiceAccountEmail: testEmail,
+				Audience:            testAudience,
+				ProjectNumber:       "123456789012",
+				PoolID:              "another-pool",
+				ProviderID:          "my-provider",
+			},
+			wantErr:  []string{"audience", "does not match the provider", "built from projectNumber, poolID and providerID"},
+			notInErr: []string{"AUDIENCE", "PROJECT_NUMBER"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.setEnvVar {
+				t.Setenv(EnvServiceAccountEmail, "someone-else@other-project.iam.gserviceaccount.com")
+				t.Setenv(EnvProjectID, "other-project")
+				t.Setenv(EnvSubjectTokenAudience, "from-env")
+			}
+			got, err := ConfigFromSpec(&tt.spec)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("expected an error, got config %+v", got)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err.Error(), want)
+					}
+				}
+				for _, unwanted := range tt.notInErr {
+					if strings.Contains(err.Error(), unwanted) {
+						t.Errorf("error %q mentions %q", err.Error(), unwanted)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }

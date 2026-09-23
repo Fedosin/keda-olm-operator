@@ -37,18 +37,44 @@ import (
 	"github.com/kedacore/keda-olm-operator/internal/controller/keda/util"
 )
 
-// gcpWorkloadIdentityTransforms brings the GCP credential Secret in line with cfg
-// and returns the transforms that wire it into the keda-operator Deployment. With
-// cfg == nil Workload Identity is not configured and no transforms are returned,
-// so the Deployment renders without any GCP wiring; a Secret left behind from an
-// earlier configuration is removed by deleteGCPCredentialsSecret once that
-// Deployment has been applied and nothing references the Secret anymore.
-func (r *KedaControllerReconciler) gcpWorkloadIdentityTransforms(ctx context.Context, logger logr.Logger, instance *kedav1alpha1.KedaController, cfg *gcp.Config) ([]mf.Transformer, error) {
+// gcpWorkloadIdentityConfig returns the GCP Workload Identity configuration in effect.
+// spec.operator.gcpWorkloadIdentity takes precedence as a whole over the operator's
+// environment, so that exactly one source applies at a time and the two are never
+// merged field by field. It returns nil when neither configures Workload Identity.
+func gcpWorkloadIdentityConfig(logger logr.Logger, instance *kedav1alpha1.KedaController) (*gcp.Config, error) {
+	envConfig, envErr := gcp.ConfigFromEnv()
+
+	if spec := instance.Spec.Operator.GCPWorkloadIdentity; spec != nil {
+		if envConfig != nil || envErr != nil {
+			logger.Info("GCP Workload Identity is configured in spec.operator.gcpWorkloadIdentity; ignoring the Workload Identity environment variables of the operator")
+		}
+		cfg, err := gcp.ConfigFromSpec(spec)
+		if err != nil {
+			return nil, fmt.Errorf("in spec.operator.gcpWorkloadIdentity: %w", err)
+		}
+		return cfg, nil
+	}
+
+	if envErr != nil {
+		return nil, fmt.Errorf("in the operator environment: %w", envErr)
+	}
+	return envConfig, nil
+}
+
+// gcpWorkloadIdentityTransforms brings the GCP credential Secret in line with cfg,
+// reports cfg in status, and returns the transforms that wire the Secret into the
+// keda-operator Deployment. With cfg == nil Workload Identity is not configured and
+// no transforms are returned, so the Deployment renders without any GCP wiring; a
+// Secret left behind from an earlier configuration is removed by
+// deleteGCPCredentialsSecret once that Deployment has been applied and nothing
+// references the Secret anymore.
+func (r *KedaControllerReconciler) gcpWorkloadIdentityTransforms(ctx context.Context, logger logr.Logger, instance *kedav1alpha1.KedaController, cfg *gcp.Config, status *kedav1alpha1.KedaControllerStatus) ([]mf.Transformer, error) {
 	if cfg == nil {
+		status.GCPWorkloadIdentity = nil
 		return nil, nil
 	}
 
-	logger.Info("Configuring GCP Workload Identity Federation for KEDA Controller", "serviceAccountEmail", cfg.ServiceAccountEmail)
+	logger.Info("Configuring GCP Workload Identity Federation for KEDA Controller", "source", cfg.Source, "serviceAccountEmail", cfg.ServiceAccountEmail)
 
 	projectID, universeDomain, err := r.gcpPlatform(ctx, logger)
 	if err != nil {
@@ -58,7 +84,7 @@ func (r *KedaControllerReconciler) gcpWorkloadIdentityTransforms(ctx context.Con
 		projectID = cfg.ProjectID
 	}
 	if projectID == "" {
-		logger.Info("GCP project ID could not be determined; keda-operator will rely on the GCE metadata server for the default project. Set " + gcp.EnvProjectID + " to configure it explicitly")
+		logger.Info("GCP project ID could not be determined; keda-operator will rely on the GCE metadata server for the default project. Set spec.operator.gcpWorkloadIdentity.projectID, or " + gcp.EnvProjectID + " when configuring through the operator environment")
 	}
 
 	credentials, err := cfg.CredentialsJSON(universeDomain)
@@ -67,6 +93,13 @@ func (r *KedaControllerReconciler) gcpWorkloadIdentityTransforms(ctx context.Con
 	}
 	if err := r.ensureGCPCredentialsSecret(ctx, logger, instance, credentials); err != nil {
 		return nil, err
+	}
+
+	status.GCPWorkloadIdentity = &kedav1alpha1.GCPWorkloadIdentityStatus{
+		Source:              cfg.Source,
+		ServiceAccountEmail: cfg.ServiceAccountEmail,
+		Audience:            cfg.Audience,
+		ProjectID:           projectID,
 	}
 
 	return gcp.DeploymentTransforms(cfg, projectID, gcp.CredentialsHash(credentials), r.Scheme), nil

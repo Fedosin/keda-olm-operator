@@ -419,12 +419,11 @@ func (r *KedaControllerReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	status := instance.Status.DeepCopy()
 
-	// The GCP Workload Identity parameters come from the operator pod's environment
-	// (set on the OLM Subscription), so a broken configuration can only be fixed by the
-	// administrator. Fail visibly instead of installing KEDA without cloud access.
-	gcpConfig, err := gcp.ConfigFromEnv()
+	// A broken GCP Workload Identity configuration can only be fixed by the administrator.
+	// Fail visibly instead of installing KEDA without cloud access.
+	gcpConfig, err := gcpWorkloadIdentityConfig(logger, instance)
 	if err != nil {
-		status.MarkInstallFailed(fmt.Sprintf("Invalid GCP Workload Identity configuration: %v", err))
+		status.MarkInstallFailed(fmt.Sprintf("Invalid GCP Workload Identity configuration %v", err))
 		if statusErr := util.UpdateKedaControllerStatus(ctx, r.Client, instance, status); statusErr != nil {
 			err = fmt.Errorf("got error: %s and then another: %s", err, statusErr)
 		}
@@ -438,7 +437,7 @@ func (r *KedaControllerReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{}, err
 	}
-	if err := r.installController(ctx, logger, instance, gcpConfig); err != nil {
+	if err := r.installController(ctx, logger, instance, gcpConfig, status); err != nil {
 		status.MarkInstallFailed("Not able to install KEDA Controller")
 		if statusErr := util.UpdateKedaControllerStatus(ctx, r.Client, instance, status); statusErr != nil {
 			err = fmt.Errorf("got error: %s and then another: %s", err, statusErr)
@@ -639,7 +638,7 @@ func (r *KedaControllerReconciler) installGeneralResources(ctx context.Context, 
 	return nil
 }
 
-func (r *KedaControllerReconciler) installController(ctx context.Context, logger logr.Logger, instance *kedav1alpha1.KedaController, gcpConfig *gcp.Config) error {
+func (r *KedaControllerReconciler) installController(ctx context.Context, logger logr.Logger, instance *kedav1alpha1.KedaController, gcpConfig *gcp.Config, status *kedav1alpha1.KedaControllerStatus) error {
 	logger.Info("Reconciling KEDA Controller deployment")
 	transforms := []mf.Transformer{
 		transform.InjectOwner(instance),
@@ -693,7 +692,7 @@ func (r *KedaControllerReconciler) installController(ctx context.Context, logger
 	// GCP Workload Identity Federation: credential Secret plus the volumes and env vars
 	// that make keda-operator pick it up. Applied before the user-defined env so that
 	// spec.operator.env can still override e.g. CLOUDSDK_CORE_PROJECT.
-	gcpTransforms, err := r.gcpWorkloadIdentityTransforms(ctx, logger, instance, gcpConfig)
+	gcpTransforms, err := r.gcpWorkloadIdentityTransforms(ctx, logger, instance, gcpConfig, status)
 	if err != nil {
 		logger.Error(err, "Unable to configure GCP Workload Identity Federation for KEDA Controller")
 		return err

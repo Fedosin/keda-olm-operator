@@ -556,6 +556,17 @@ var _ = Describe("Testing functionality", func() {
 			Expect(scheme.Convert(u, dep, nil)).To(Succeed())
 			return dep
 		}
+		// gcpStatus returns status.gcpWorkloadIdentity as last written by the reconciler.
+		gcpStatus := func(g Gomega) *kedav1alpha1.GCPWorkloadIdentityStatus {
+			kedaController := &kedav1alpha1.KedaController{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: namespace, Namespace: namespace}, kedaController)).To(Succeed())
+			return kedaController.Status.GCPWorkloadIdentity
+		}
+		// withoutWIF drops spec.operator.gcpWorkloadIdentity from the KedaController.
+		withoutWIF := func(instance *kedav1alpha1.KedaController) error {
+			instance.Spec.Operator.GCPWorkloadIdentity = nil
+			return nil
+		}
 		volumeNames := func(dep *appsv1.Deployment) []string {
 			var names []string
 			for _, v := range dep.Spec.Template.Spec.Volumes {
@@ -590,10 +601,11 @@ var _ = Describe("Testing functionality", func() {
 		})
 
 		AfterEach(func() {
-			// Leave the operand the way the other specs expect it: no WIF variables, and a
-			// reconcile that has dropped the Secret and the Deployment wiring again.
+			// Leave the operand the way the other specs expect it: no WIF variables, no WIF
+			// block in the KedaController, and a reconcile that has dropped the Secret and
+			// the Deployment wiring again.
 			clearWIFEnv()
-			reconcile(CurrentSpecReport().LeafNodeText+" (cleanup)", noop)
+			reconcile(CurrentSpecReport().LeafNodeText+" (cleanup)", withoutWIF)
 			Eventually(func() error {
 				err := k8sClient.Get(ctx, secretKey, &corev1.Secret{})
 				if err == nil {
@@ -661,6 +673,16 @@ var _ = Describe("Testing functionality", func() {
 			Expect(err).To(BeNil())
 			Expect(project.Value).To(Equal("my-project"))
 			Expect(dep.Spec.Template.Annotations).To(HaveKeyWithValue(gcp.CredentialsHashAnnotation, gcp.CredentialsHash(secret.Data[gcp.CredentialsSecretKey])))
+
+			By("Checking that the status reports the configuration and where it comes from")
+			Eventually(func(g Gomega) {
+				g.Expect(gcpStatus(g)).To(Equal(&kedav1alpha1.GCPWorkloadIdentityStatus{
+					Source:              kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
+					ServiceAccountEmail: serviceAccountEmail,
+					Audience:            audience,
+					ProjectID:           "my-project",
+				}))
+			}, timeout, interval).Should(Succeed())
 		})
 
 		It("Should honor the CLI variables, a custom token audience and spec.operator.env overrides", func() {
@@ -747,6 +769,11 @@ var _ = Describe("Testing functionality", func() {
 			_, err = getDepEnv(dep, "CLOUDSDK_CORE_PROJECT", operatorContainer)
 			Expect(err).To(HaveOccurred())
 			Expect(dep.Spec.Template.Annotations).ToNot(HaveKey(gcp.CredentialsHashAnnotation))
+
+			By("Checking that the status no longer reports Workload Identity")
+			Eventually(func(g Gomega) {
+				g.Expect(gcpStatus(g)).To(BeNil())
+			}, timeout, interval).Should(Succeed())
 		})
 
 		// Secrets of our name that the operator must not take over: one controlled by
@@ -809,16 +836,23 @@ var _ = Describe("Testing functionality", func() {
 				Expect(metav1.IsControlledBy(current, kedaController)).To(BeFalse())
 
 				By("Removing the foreign Secret so the reconcile can recover")
+				// The failed reconcile is being retried, so the operator may create its own
+				// Secret of the same name right away; only the foreign one has to be gone.
+				foreignUID := current.UID
 				Expect(k8sClient.Delete(ctx, current)).To(Succeed())
 				Eventually(func() error {
-					err := k8sClient.Get(ctx, secretKey, &corev1.Secret{})
-					if err == nil {
-						return errors.New("foreign Secret still exists")
-					}
+					secret := &corev1.Secret{}
+					err := k8sClient.Get(ctx, secretKey, secret)
 					if k8serrors.IsNotFound(err) {
 						return nil
 					}
-					return err
+					if err != nil {
+						return err
+					}
+					if secret.UID == foreignUID {
+						return errors.New("foreign Secret still exists")
+					}
+					return nil
 				}, timeout, interval).Should(Succeed())
 				reconcile(caseName+" (recovered)", noop)
 				Eventually(func(g Gomega) {
@@ -843,7 +877,7 @@ var _ = Describe("Testing functionality", func() {
 				kedaController := &kedav1alpha1.KedaController{}
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: namespace, Namespace: namespace}, kedaController)).To(Succeed())
 				g.Expect(kedaController.Status.Phase).To(Equal(kedav1alpha1.PhaseFailed))
-				g.Expect(kedaController.Status.Reason).To(ContainSubstring("Invalid GCP Workload Identity configuration"))
+				g.Expect(kedaController.Status.Reason).To(ContainSubstring("Invalid GCP Workload Identity configuration in the operator environment"))
 				g.Expect(kedaController.Status.Reason).To(ContainSubstring("AUDIENCE"))
 			}, timeout, interval).Should(Succeed())
 
@@ -859,6 +893,151 @@ var _ = Describe("Testing functionality", func() {
 				g.Expect(kedaController.Status.Phase).To(Equal(kedav1alpha1.PhaseInstallSucceeded))
 			}, timeout, interval).Should(Succeed())
 		})
+
+		It("Should prefer spec.operator.gcpWorkloadIdentity over the operator environment as a whole", func() {
+			caseName := CurrentSpecReport().LeafNodeText
+			const envEmail = "from-env@other-project.iam.gserviceaccount.com"
+
+			By("Configuring WIF in the operator environment")
+			Expect(os.Setenv(gcp.EnvAudience, audience)).To(Succeed())
+			Expect(os.Setenv(gcp.EnvServiceAccountEmail, envEmail)).To(Succeed())
+			Expect(os.Setenv(gcp.EnvProjectID, "env-project")).To(Succeed())
+			Expect(os.Setenv(gcp.EnvSubjectTokenAudience, "from-env")).To(Succeed())
+
+			By("Configuring it differently in the KedaController")
+			reconcile(caseName+" (spec)", func(instance *kedav1alpha1.KedaController) error {
+				instance.Spec.Operator.GCPWorkloadIdentity = &kedav1alpha1.GCPWorkloadIdentitySpec{
+					ServiceAccountEmail: serviceAccountEmail,
+					ProjectNumber:       "123456789012",
+					PoolID:              "my-pool",
+					ProviderID:          "my-provider",
+					ProjectID:           "spec-project",
+				}
+				return nil
+			})
+
+			By("Checking that only the KedaController's values are in effect")
+			Eventually(func(g Gomega) {
+				secret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
+				var creds map[string]any
+				g.Expect(json.Unmarshal(secret.Data[gcp.CredentialsSecretKey], &creds)).To(Succeed())
+				g.Expect(creds).To(HaveKeyWithValue("audience", audience))
+				g.Expect(creds["service_account_impersonation_url"]).To(ContainSubstring(serviceAccountEmail))
+			}, timeout, interval).Should(Succeed())
+			dep := getOperatorDeployment()
+			project, err := getDepEnv(dep, "CLOUDSDK_CORE_PROJECT", operatorContainer)
+			Expect(err).To(BeNil())
+			Expect(project.Value).To(Equal("spec-project"))
+			for _, v := range dep.Spec.Template.Spec.Volumes {
+				if v.Name == "bound-sa-token" {
+					// not merged with SUBJECT_TOKEN_AUDIENCE from the environment
+					Expect(v.Projected.Sources[0].ServiceAccountToken.Audience).To(Equal(gcp.DefaultSubjectTokenAudience))
+				}
+			}
+			Eventually(func(g Gomega) {
+				g.Expect(gcpStatus(g)).To(Equal(&kedav1alpha1.GCPWorkloadIdentityStatus{
+					Source:              kedav1alpha1.GCPWorkloadIdentitySourceKedaController,
+					ServiceAccountEmail: serviceAccountEmail,
+					Audience:            audience,
+					ProjectID:           "spec-project",
+				}))
+			}, timeout, interval).Should(Succeed())
+
+			By("Removing the block from the KedaController, which falls back to the environment")
+			reconcile(caseName+" (environment)", withoutWIF)
+			Eventually(func(g Gomega) {
+				g.Expect(gcpStatus(g)).To(Equal(&kedav1alpha1.GCPWorkloadIdentityStatus{
+					Source:              kedav1alpha1.GCPWorkloadIdentitySourceOperatorEnvironment,
+					ServiceAccountEmail: envEmail,
+					Audience:            audience,
+					ProjectID:           "env-project",
+				}))
+				secret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
+				var creds map[string]any
+				g.Expect(json.Unmarshal(secret.Data[gcp.CredentialsSecretKey], &creds)).To(Succeed())
+				g.Expect(creds["service_account_impersonation_url"]).To(ContainSubstring(envEmail))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("Should ignore an invalid operator environment when the KedaController configures WIF", func() {
+			caseName := CurrentSpecReport().LeafNodeText
+
+			By("Leaving an incomplete configuration in the operator environment")
+			Expect(os.Setenv(gcp.EnvServiceAccountEmail, "leftover@other-project.iam.gserviceaccount.com")).To(Succeed())
+
+			By("Configuring WIF in the KedaController")
+			reconcile(caseName, func(instance *kedav1alpha1.KedaController) error {
+				instance.Spec.Operator.GCPWorkloadIdentity = &kedav1alpha1.GCPWorkloadIdentitySpec{
+					ServiceAccountEmail: serviceAccountEmail,
+					Audience:            audience,
+				}
+				return nil
+			})
+			Eventually(func(g Gomega) {
+				kedaController := &kedav1alpha1.KedaController{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: namespace, Namespace: namespace}, kedaController)).To(Succeed())
+				g.Expect(kedaController.Status.Phase).To(Equal(kedav1alpha1.PhaseInstallSucceeded))
+				g.Expect(kedaController.Status.GCPWorkloadIdentity).ToNot(BeNil())
+				g.Expect(kedaController.Status.GCPWorkloadIdentity.Source).To(Equal(kedav1alpha1.GCPWorkloadIdentitySourceKedaController))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		invalidSpecs := []struct {
+			description string
+			spec        kedav1alpha1.GCPWorkloadIdentitySpec
+			message     string
+		}{
+			{
+				description: "neither an audience nor a provider",
+				spec:        kedav1alpha1.GCPWorkloadIdentitySpec{ServiceAccountEmail: serviceAccountEmail},
+				message:     "either audience or all of projectNumber, poolID and providerID must be set",
+			},
+			{
+				description: "an incomplete provider",
+				spec:        kedav1alpha1.GCPWorkloadIdentitySpec{ServiceAccountEmail: serviceAccountEmail, ProjectNumber: "123456789012", PoolID: "my-pool"},
+				message:     "projectNumber, poolID and providerID must be set together",
+			},
+			{
+				description: "an audience contradicting the provider",
+				spec: kedav1alpha1.GCPWorkloadIdentitySpec{
+					ServiceAccountEmail: serviceAccountEmail, Audience: audience,
+					ProjectNumber: "123456789012", PoolID: "another-pool", ProviderID: "my-provider",
+				},
+				message: "audience does not match the provider",
+			},
+			{
+				description: "a malformed service account email",
+				spec:        kedav1alpha1.GCPWorkloadIdentitySpec{ServiceAccountEmail: "123456789012", Audience: audience},
+				message:     "serviceAccountEmail",
+			},
+			{
+				description: "a non-numeric project number",
+				spec: kedav1alpha1.GCPWorkloadIdentitySpec{
+					ServiceAccountEmail: serviceAccountEmail, ProjectNumber: "my-project", PoolID: "my-pool", ProviderID: "my-provider",
+				},
+				message: "projectNumber",
+			},
+			{
+				description: "a missing service account email",
+				spec:        kedav1alpha1.GCPWorkloadIdentitySpec{Audience: audience},
+				message:     "serviceAccountEmail",
+			},
+		}
+
+		for _, variant := range invalidSpecs {
+			It("Should reject spec.operator.gcpWorkloadIdentity with "+variant.description, func() {
+				spec := variant.spec
+				manifest, err = mutateKedaController(manifest, scheme, CurrentSpecReport().LeafNodeText, func(instance *kedav1alpha1.KedaController) error {
+					instance.Spec.Operator.GCPWorkloadIdentity = &spec
+					return nil
+				})
+				Expect(err).To(BeNil())
+				Expect(manifest.Apply()).To(MatchError(ContainSubstring(variant.message)))
+				Expect(k8serrors.IsNotFound(k8sClient.Get(ctx, secretKey, &corev1.Secret{}))).To(BeTrue())
+			})
+		}
 	})
 
 })
